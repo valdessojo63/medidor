@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Medidor por cámara (LED kWh)</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial;background:#0b1220;color:#e6eefb;margin:0;padding:16px}
+    .wrap{max-width:980px;margin:auto}
+    h1{font-size:1.4rem;margin:0 0 8px}
+    .card{background:#111a2b;border:1px solid #20304d;border-radius:14px;padding:14px;margin:12px 0;box-shadow:0 4px 16px rgba(0,0,0,.25)}
+    label{display:block;margin-top:8px;font-size:.95rem}
+    input[type="number"],input[type="range"],select{width:100%;padding:8px;border-radius:10px;border:1px solid #20304d;background:#0f1828;color:#e6eefb}
+    button{background:#317aff;color:white;border:none;padding:10px 14px;border-radius:12px;font-weight:600;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+    .stat{background:#0f1828;border:1px solid #20304d;border-radius:12px;padding:10px;text-align:center}
+    .stat .v{font-size:1.4rem;font-weight:800}
+    video,canvas{width:100%;max-height:360px;border-radius:12px;background:#000}
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .hint{font-size:.9rem;color:#9fb3d6}
+    .bad{color:#ff8f8f}
+    .good{color:#7ff0a5}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Medir consumo con la cámara del teléfono (LED del medidor)</h1>
+    <div class="card">
+      <p>
+        Apunta la cámara al <b>LED rojo de impulsos</b> del medidor (normalmente dice
+        <i>1000 imp/kWh</i> o similar). Cada destello representa una fracción de kWh.
+        Este experimento estima la <b>potencia instantánea</b> y el <b>consumo</b> a partir de los destellos.
+      </p>
+      <div class="grid">
+        <div>
+          <label>Impulsos por kWh (del medidor)</label>
+          <input id="impPerKwh" type="number" min="100" step="1" value="1000" />
+        </div>
+        <div>
+          <label>Umbral de brillo (ajústalo si no detecta)</label>
+          <input id="threshold" type="range" min="10" max="250" value="140" />
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="startBtn">Iniciar cámara</button>
+        <button id="stopBtn" disabled>Detener</button>
+        <span class="hint">Consejo: Acerca la cámara al LED y evita reflejos. Si hay falso conteo, sube el umbral.</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="stats">
+        <div class="stat"><div class="v" id="power">0.00</div><div>Potencia estimada (kW)</div></div>
+        <div class="stat"><div class="v" id="pulsesMin">0</div><div>Pulsos/min</div></div>
+        <div class="stat"><div class="v" id="energy">0.000</div><div>Energía (kWh) sesión</div></div>
+        <div class="stat"><div class="v" id="lastPulse">–</div><div>Último pulso (s)</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="grid">
+        <div>
+          <video id="video" playsinline muted></video>
+        </div>
+        <div>
+          <canvas id="canvas"></canvas>
+          <p class="hint">La caja amarilla es la <b>zona de interés</b> (ROI). Arrástrala para centrar el LED.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <p class="hint">Notas rápidas:</p>
+      <ul class="hint">
+        <li>Potencia ≈ (pulsos/min × 60) / (impulsos por kWh)  en kW.</li>
+        <li>Si tu medidor dice 1600 imp/kWh, cámbialo arriba.</li>
+        <li>Este método es <b>experimental</b> y sirve para verificar que tu prepago descuenta por kWh (no por kVArh).</li>
+      </ul>
+    </div>
+  </div>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const impPerKwhInput = document.getElementById('impPerKwh');
+    const thresholdInput = document.getElementById('threshold');
+
+    const powerEl = document.getElementById('power');
+    const pulsesMinEl = document.getElementById('pulsesMin');
+    const energyEl = document.getElementById('energy');
+    const lastPulseEl = document.getElementById('lastPulse');
+
+    let stream, anim;
+    let roi = {x: 40, y: 40, w: 120, h: 120};
+
+    // Drag ROI
+    let dragging = false, offX = 0, offY = 0;
+    canvas.addEventListener('mousedown', e => {
+      const r = canvas.getBoundingClientRect();
+      const x = e.clientX - r.left, y = e.clientY - r.top;
+      if(x>roi.x && x<roi.x+roi.w && y>roi.y && y<roi.y+roi.h){
+        dragging = true; offX = x - roi.x; offY = y - roi.y;
+      }
+    });
+    window.addEventListener('mouseup', ()=> dragging=false);
+    window.addEventListener('mousemove', e =>{
+      if(!dragging) return; const r = canvas.getBoundingClientRect();
+      roi.x = Math.max(0, Math.min(canvas.width-roi.w, e.clientX - r.left - offX));
+      roi.y = Math.max(0, Math.min(canvas.height-roi.h, e.clientY - r.top - offY));
+    });
+
+    // Pulse detection
+    let lastPulseTime = 0, pulses = [];
+    let sessionEnergyKwh = 0;
+    let armed = true; // edge detector to avoid multiple counts per flash
+
+    function avgBrightness(imgData){
+      let sum = 0; const d = imgData.data;
+      for(let i=0;i<d.length;i+=4){ // r,g,b,a
+        // simple luminance
+        sum += (d[i]*0.2126 + d[i+1]*0.7152 + d[i+2]*0.0722);
+      }
+      return sum / (d.length/4);
+    }
+
+    async function start(){
+      try{
+        stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+        video.srcObject = stream; await video.play();
+        canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+        stopBtn.disabled = false; startBtn.disabled = true;
+        loop();
+      }catch(err){
+        alert('No se pudo iniciar la cámara: '+err.message);
+      }
+    }
+
+    function stop(){
+      if(stream){ stream.getTracks().forEach(t=>t.stop()); }
+      cancelAnimationFrame(anim); startBtn.disabled = false; stopBtn.disabled = true;
+    }
+
+    function loop(){
+      anim = requestAnimationFrame(loop);
+      if(video.readyState<2) return;
+      ctx.drawImage(video,0,0,canvas.width,canvas.height);
+      // draw ROI
+      ctx.strokeStyle = 'yellow'; ctx.lineWidth = 2; ctx.strokeRect(roi.x,roi.y,roi.w,roi.h);
+      const img = ctx.getImageData(roi.x,roi.y,roi.w,roi.h);
+      const bright = avgBrightness(img);
+
+      const th = parseInt(thresholdInput.value,10);
+      const now = performance.now();
+
+      if(bright>th && armed){
+        // detect pulse rising edge
+        const dt = (now - lastPulseTime)/1000; // seconds
+        lastPulseTime = now; armed = false; setTimeout(()=>armed=true, 120); // debounce ~120ms
+        if(dt>0.15 && dt<10){ // ignore first and crazy intervals
+          pulses.push(now);
+          // update metrics
+          const ppm = pulses.length>1 ? 60000 / (now - pulses[pulses.length-2]) : 0; // pulses per minute
+          const impPerKwh = Math.max(1, parseFloat(impPerKwhInput.value||1000));
+          const kW = (ppm*60)/impPerKwh; // pulses/min * 60 / impPerKwh
+          powerEl.textContent = kW.toFixed(2);
+          pulsesMinEl.textContent = ppm.toFixed(1);
+          lastPulseEl.textContent = dt.toFixed(2);
+          sessionEnergyKwh += 1/impPerKwh; // 1 pulse = 1/impPerKwh kWh
+          energyEl.textContent = sessionEnergyKwh.toFixed(3);
+        }
+      }
+      if(bright<=th){
+        // ready for next pulse soon
+      }
+    }
+
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+  </script>
+</body>
+</html>
